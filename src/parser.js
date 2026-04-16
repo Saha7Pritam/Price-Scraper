@@ -1,18 +1,29 @@
-// Extracts ALL product links from a category/listing page
+// ─────────────────────────────────────────────────────────────
+//  parser.js  —  primeabgb.com
+//  Handles:
+//    1. parseProductLinks()  — scrapes one listing page
+//    2. getNextPageUrl()     — finds the "Next" pagination link
+//    3. parseProductDetails() — scrapes a single product page
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Extracts all product links from a category/listing page.
+ *
+ * primeabgb listing pages are WooCommerce-powered.
+ * Product links look like:
+ *   /online-price-reviews-india/intel-core-ultra-5-250k-plus-processor.../
+ *
+ * We filter by that URL segment to avoid nav/breadcrumb noise.
+ */
 async function parseProductLinks(page) {
   return await page.evaluate(() => {
     const links = new Set();
 
-    // Grab all anchor tags that look like product pages
     document.querySelectorAll('a[href]').forEach(a => {
       const href = a.href;
-      // Product URLs typically look like /p/ or /product/ or contain an ID
-      if (
-        href.includes('/p/') ||
-        href.includes('/product/') ||
-        href.match(/pcpricetracker\.in\/[a-z0-9-]{8,}$/)
-      ) {
-        links.add(href);
+      // primeabgb product pages always contain this path segment
+      if (href.includes('/online-price-reviews-india/')) {
+        links.add(href.split('?')[0]); // strip query params
       }
     });
 
@@ -20,101 +31,142 @@ async function parseProductLinks(page) {
   });
 }
 
-// Extracts ALL data from a single product detail page
+/**
+ * Returns the URL of the next pagination page, or null if we're on the last page.
+ *
+ * WooCommerce pagination looks like:
+ *   <a class="next page-numbers" href=".../?page=2">Next »</a>
+ */
+async function getNextPageUrl(page) {
+  return await page.evaluate(() => {
+    const next = document.querySelector('a.next.page-numbers');
+    return next ? next.href : null;
+  });
+}
+
+/**
+ * Extracts all relevant data from a single product detail page.
+ *
+ * Target fields from your screenshots:
+ *  - Product name (h1)
+ *  - Price (sale price + original price)
+ *  - SKU  ← this is what you need that pcpricetracker didn't have
+ *  - Stock status
+ *  - Category (from breadcrumb)
+ *  - Product images
+ *  - Discount percentage
+ *  - Specifications / attributes table
+ *
+ * primeabgb runs WooCommerce so selectors are very standard.
+ */
 async function parseProductDetails(page, url) {
   return await page.evaluate((pageUrl) => {
     const getText = (selector) =>
       document.querySelector(selector)?.innerText?.trim() || null;
 
-    const getAll = (selector) =>
-      [...document.querySelectorAll(selector)].map(el => el.innerText?.trim()).filter(Boolean);
-
     const getAttr = (selector, attr) =>
       document.querySelector(selector)?.getAttribute(attr) || null;
 
-    // ── Basic Info ──────────────────────────────────────────
+    // ── Name ──────────────────────────────────────────────────
     const name =
-      getText('h1') ||
-      getText('.product-title') ||
-      getText('.product-name');
+      getText('.product_title') ||   // WooCommerce standard
+      getText('h1.entry-title') ||
+      getText('h1');
 
-    const category =
-      getText('.breadcrumb li:last-child') ||
-      getText('.category') ||
+    // ── Prices ────────────────────────────────────────────────
+    // Sale price  → <ins> tag inside .price
+    // Original    → <del> tag inside .price
+    const salePrice =
+      getText('.price ins .woocommerce-Price-amount') ||
+      getText('.price ins') ||
+      getText('.woocommerce-Price-amount');              // if no sale, only one price shown
+
+    const originalPrice =
+      getText('.price del .woocommerce-Price-amount') ||
+      getText('.price del') ||
       null;
 
-    const image =
-      getAttr('img.product-image, .product-img img, main img', 'src') ||
+    // Discount badge (e.g. "45% Off")
+    const discountBadge =
+      getText('.onsale') ||
+      getText('.badge-sale') ||
+      getText('.woocommerce-badge') ||
       null;
 
-    // ── Prices from multiple stores ─────────────────────────
-    // The site shows prices from Amazon, Flipkart, MDComputers etc.
-    const storePrices = [];
-    document.querySelectorAll(
-      '.store-row, .retailer-row, .price-row, tr, .store-item'
-    ).forEach(row => {
-      const storeName =
-        row.querySelector('.store-name, .retailer, td:first-child, .store')
-           ?.innerText?.trim();
-      const price =
-        row.querySelector('.price, .store-price, td.price, .current-price')
-           ?.innerText?.trim();
-      const link =
-        row.querySelector('a[href]')?.href || null;
-      const availability =
-        row.querySelector('.stock, .availability, .in-stock')
-           ?.innerText?.trim() || null;
+    // ── SKU ───────────────────────────────────────────────────
+    // WooCommerce puts SKU in .sku element
+    // From your screenshot: SKU: BX80768250K
+    const sku =
+      getText('.sku') ||
+      getText('[class*="sku"]') ||
+      null;
 
-      if (storeName && price) {
-        storePrices.push({ store: storeName, price, link, availability });
-      }
-    });
+    // ── Stock Status ──────────────────────────────────────────
+    // "In Stock" / "Out of Stock"
+    const stockStatus =
+      getText('.stock') ||
+      getText('.availability .value') ||
+      null;
 
-    // ── Price History ───────────────────────────────────────
-    // Grab any price history table rows if present
-    const priceHistory = [];
-    document.querySelectorAll('.price-history tr, .history-row').forEach(row => {
-      const date = row.querySelector('td:first-child')?.innerText?.trim();
-      const price = row.querySelector('td:last-child')?.innerText?.trim();
-      if (date && price) priceHistory.push({ date, price });
-    });
+    // ── Category (from breadcrumb) ────────────────────────────
+    // Last breadcrumb item before the product name
+    const breadcrumbs = [...document.querySelectorAll('.woocommerce-breadcrumb a, nav.breadcrumb a')]
+      .map(a => a.innerText.trim())
+      .filter(Boolean);
 
-    // ── Specifications ──────────────────────────────────────
+    // "Home > Shop > CPU (Processor)" — we want "CPU (Processor)"
+    const category = breadcrumbs.length > 1
+      ? breadcrumbs[breadcrumbs.length - 1]
+      : getText('.posted_in a') || null;
+
+    // ── Tags ──────────────────────────────────────────────────
+    // From your screenshot: Tags: BX80768250K, Core Ultra 7 250K Plus
+    const tags = [...document.querySelectorAll('.tagged_as a')]
+      .map(a => a.innerText.trim())
+      .filter(Boolean);
+
+    // ── Images ───────────────────────────────────────────────
+    const images = [...document.querySelectorAll(
+      '.woocommerce-product-gallery img, .product-images img'
+    )]
+      .map(img => img.getAttribute('src') || img.getAttribute('data-src'))
+      .filter(Boolean);
+
+    // ── Specifications / Attributes table ─────────────────────
+    // WooCommerce renders specs in a table inside .woocommerce-product-attributes
+    // or a standard HTML table in the "Additional information" tab
     const specs = {};
     document.querySelectorAll(
-      '.spec-row, .specs tr, .specifications tr, .spec-item'
+      '.woocommerce-product-attributes tr, .shop_attributes tr, table.variations tr'
     ).forEach(row => {
-      const key   = row.querySelector('td:first-child, .spec-key, th')?.innerText?.trim();
-      const value = row.querySelector('td:last-child, .spec-value, td:nth-child(2)')?.innerText?.trim();
+      const key   = row.querySelector('th')?.innerText?.trim();
+      const value = row.querySelector('td')?.innerText?.trim();
       if (key && value) specs[key] = value;
     });
 
-    // ── Lowest / Highest Price Summary ──────────────────────
-    const lowestPrice  = getText('.lowest-price, .min-price, .best-price') ||
-                         (storePrices.length
-                           ? storePrices.reduce((a, b) =>
-                               parseFloat(a.price?.replace(/[^0-9.]/g, '')) <
-                               parseFloat(b.price?.replace(/[^0-9.]/g, '')) ? a : b
-                             ).price
-                           : null);
+    // ── Short Description ─────────────────────────────────────
+    const shortDescription =
+      getText('.woocommerce-product-details__short-description') ||
+      getText('.short-description') ||
+      null;
 
-    const rating       = getText('.rating, .product-rating, .stars');
-    const reviewCount  = getText('.review-count, .num-reviews');
-
+    // ── Assemble ──────────────────────────────────────────────
     return {
       url: pageUrl,
       name,
+      sku,               // ← KEY FIELD you were missing
       category,
-      image,
-      lowestPrice,
-      rating,
-      reviewCount,
-      storePrices,      // array: [{ store, price, link, availability }]
-      priceHistory,     // array: [{ date, price }]
-      specs,            // object: { "Brand": "ASUS", "Memory": "8GB", ... }
+      stockStatus,
+      salePrice,
+      originalPrice,
+      discountBadge,
+      shortDescription,
+      tags,
+      images,
+      specs,
       scrapedAt: new Date().toISOString(),
     };
   }, url);
 }
 
-module.exports = { parseProductLinks, parseProductDetails };
+module.exports = { parseProductLinks, getNextPageUrl, parseProductDetails };
