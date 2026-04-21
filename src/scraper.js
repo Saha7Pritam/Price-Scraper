@@ -3,11 +3,10 @@
 //
 //  Run: node src/scraper.js
 //
-//  - Reads all stores + categories from urls.js
-//  - Each store/category gets its own output folder
-//  - Fully resumable: if crashed, re-run and it continues
-//  - Each store uses its own parser (different HTML = different selectors)
-//  - Browser auto-reconnects on disconnect
+//  Logic per store:
+//    - freeScrapable: true  → try free Playwright first
+//                             if blocked/fails → fall back to Bright Data
+//    - freeScrapable: false → go straight to Bright Data
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -18,10 +17,60 @@ const { STORES } = require('./urls');
 
 const AUTH = process.env.BRIGHT_DATA_AUTH;
 
-// ── Browser state ─────────────────────────────────────────────
-let _browser = null;
+// ─────────────────────────────────────────────────────────────
+//  BROWSER MANAGEMENT — two separate browser instances
+//  _freeBrowser  : plain local Chromium (free, no proxy)
+//  _paidBrowser  : Bright Data CDP connection (paid)
+// ─────────────────────────────────────────────────────────────
 
-async function connectBrowser(retries = 5) {
+let _freeBrowser = null;
+let _paidBrowser = null;
+
+// ── Free browser ──────────────────────────────────────────────
+
+async function launchFreeBrowser() {
+  console.log('🆓 Launching free local Chromium...');
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1280,800',
+    ],
+  });
+  browser.on('disconnected', () => { _freeBrowser = null; });
+  console.log('✅ Free browser ready');
+  return browser;
+}
+
+async function getFreeBrowser() {
+  if (!_freeBrowser) _freeBrowser = await launchFreeBrowser();
+  return _freeBrowser;
+}
+
+async function newStealthPage(browser) {
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-IN',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-IN,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  return await context.newPage();
+}
+
+// ── Paid browser (Bright Data) ────────────────────────────────
+
+async function connectPaidBrowser(retries = 5) {
   for (let i = 1; i <= retries; i++) {
     try {
       console.log(`🔌 Connecting to Bright Data... (attempt ${i})`);
@@ -29,10 +78,10 @@ async function connectBrowser(retries = 5) {
         `wss://${AUTH}@brd.superproxy.io:9222`,
         { timeout: 60_000 }
       );
-      console.log('✅ Connected\n');
+      console.log('✅ Bright Data connected');
       browser.on('disconnected', () => {
-        console.log('\n⚡ Browser disconnected — will reconnect on next request');
-        _browser = null;
+        console.log('⚡ Bright Data browser disconnected — will reconnect');
+        _paidBrowser = null;
       });
       return browser;
     } catch (err) {
@@ -42,20 +91,29 @@ async function connectBrowser(retries = 5) {
         console.log(`  ⏳ Retrying in ${wait / 1000}s...`);
         await new Promise(r => setTimeout(r, wait));
       } else {
-        throw new Error(`Could not connect after ${retries} attempts`);
+        throw new Error(`Could not connect to Bright Data after ${retries} attempts`);
       }
     }
   }
 }
 
-async function getBrowser() {
-  if (!_browser) _browser = await connectBrowser();
-  return _browser;
+async function getPaidBrowser() {
+  if (!_paidBrowser) _paidBrowser = await connectPaidBrowser();
+  return _paidBrowser;
 }
 
-// ── Navigation ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  NAVIGATION — two variants (free vs paid)
+// ─────────────────────────────────────────────────────────────
 
-async function navigateSafe(page, url) {
+async function navigateFree(page, url) {
+  await page.goto(url, { timeout: 90_000, waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('body', { timeout: 30_000 });
+  const delay = 1500 + Math.floor(Math.random() * 2000);
+  await page.waitForTimeout(delay);
+}
+
+async function navigatePaid(page, url) {
   await page.goto(url, { timeout: 2 * 60 * 1000, waitUntil: 'domcontentloaded' });
   try {
     const client = await page.context().newCDPSession(page);
@@ -66,7 +124,44 @@ async function navigateSafe(page, url) {
   await page.waitForTimeout(2000);
 }
 
-// ── File helpers ──────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  DETECTION HELPERS
+//  These detect if a free scrape was blocked so we know
+//  whether to fall back to Bright Data.
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the page content looks like a block/CAPTCHA page
+ * rather than real product data.
+ */
+async function isPageBlocked(page) {
+  const title = await page.title().catch(() => '');
+  const content = await page.content().catch(() => '');
+
+  const blockSignals = [
+    'Just a moment',        // Cloudflare challenge
+    'cf-browser-verification',
+    'captcha',
+    'Access denied',
+    'Error 403',
+    'Error 503',
+    '429 Too Many',
+    'blocked',
+    'robot',
+  ];
+
+  const titleLower = title.toLowerCase();
+  const contentLower = content.toLowerCase();
+
+  return blockSignals.some(signal =>
+    titleLower.includes(signal.toLowerCase()) ||
+    contentLower.includes(signal.toLowerCase())
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FILE HELPERS
+// ─────────────────────────────────────────────────────────────
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -81,32 +176,16 @@ function writeJson(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
-// ── Per store+category output paths ──────────────────────────
-// output/
-//   primeabgb/
-//     cpu-processor/
-//       collected_urls.json   ← all product URLs found
-//       visited.json          ← which ones we've scraped
-//       products_full.json    ← all fields
-//       products_prices.json  ← price-only summary
-//     motherboards/
-//       ...
-//   mdcomputers/
-//     cpu-processor/
-//       ...
-
 function getPaths(storeName, categorySlug) {
   const dir = path.join('output', storeName, categorySlug);
   return {
     dir,
-    urlsCache:     path.join(dir, 'collected_urls.json'),
-    visitedCache:  path.join(dir, 'visited.json'),
-    fullOutput:    path.join(dir, 'products_full.json'),
-    priceOutput:   path.join(dir, 'products_prices.json'),
+    urlsCache:    path.join(dir, 'collected_urls.json'),
+    visitedCache: path.join(dir, 'visited.json'),
+    fullOutput:   path.join(dir, 'products_full.json'),
+    priceOutput:  path.join(dir, 'products_prices.json'),
   };
 }
-
-// ── Save helpers ──────────────────────────────────────────────
 
 function appendProduct(fullOutputPath, product) {
   const existing = readJson(fullOutputPath, []);
@@ -117,53 +196,99 @@ function appendProduct(fullOutputPath, product) {
 function rebuildPriceFile(fullOutputPath, priceOutputPath) {
   const all = readJson(fullOutputPath, []);
   const prices = all.map(p => ({
-    store:         p.store,
-    sku:           p.sku,
-    name:          p.name,
-    category:      p.category,
-    salePrice:     p.salePrice,
-    originalPrice: p.originalPrice,
-    stockStatus:   p.stockStatus,
-    discountBadge: p.discountBadge,
-    tags:          p.tags,
-    url:           p.url,
-    scrapedAt:     p.scrapedAt,
+    store:          p.store,
+    sku:            p.sku,
+    name:           p.name,
+    category:       p.category,
+    salePrice:      p.salePrice,
+    originalPrice:  p.originalPrice,
+    stockStatus:    p.stockStatus,
+    discountBadge:  p.discountBadge,
+    partIds:        p.partIds,
+    lowestPrice:    p.lowestPrice,
+    retailerPrices: p.retailerPrices,
+    tags:           p.tags,
+    url:            p.url,
+    scrapedAt:      p.scrapedAt,
+    scrapedVia:     p.scrapedVia,  // 'free' or 'brightdata'
   }));
   writeJson(priceOutputPath, prices);
 }
 
-// ── Core scraping logic ───────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  URL COLLECTION — with free/paid fallback
+// ─────────────────────────────────────────────────────────────
 
-async function collectUrlsForCategory(parser, startUrl, urlsCachePath) {
+async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   const saved = readJson(urlsCachePath, null);
   if (saved) {
     console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
     return new Set(saved);
   }
 
+  const { parser, freeScrapable } = store;
   const productUrls = new Set();
   let currentUrl = startUrl;
   let pageNum = 1;
+  // Track if free scraping worked — if first page fails, switch to paid for all remaining pages
+  let useFree = freeScrapable;
 
   while (currentUrl) {
-    console.log(`  📄 Page ${pageNum}: ${currentUrl}`);
+    console.log(`  📄 Page ${pageNum} [${useFree ? '🆓 free' : '💳 paid'}]: ${currentUrl}`);
     let page = null;
-    try {
-      const browser = await getBrowser();
-      page = await browser.newPage();
-      await navigateSafe(page, currentUrl);
-      const links = await parser.parseProductLinks(page);
-      console.log(`     ↳ ${links.length} links`);
-      links.forEach(l => productUrls.add(l));
-      currentUrl = await parser.getNextPageUrl(page);
-      pageNum++;
-    } catch (err) {
-      console.error(`  ❌ Listing page error: ${err.message}`);
-      if (err.message.includes('closed') || err.message.includes('disconnected')) _browser = null;
-      currentUrl = null;
-    } finally {
-      if (page) try { await page.close(); } catch (_) {}
+    let success = false;
+
+    // ── Try free first (if enabled) ──────────────────────────
+    if (useFree) {
+      try {
+        const browser = await getFreeBrowser();
+        page = await newStealthPage(browser);
+        await navigateFree(page, currentUrl);
+
+        const blocked = await isPageBlocked(page);
+        if (blocked) {
+          console.log(`  ⚠️  Free scrape blocked — switching to Bright Data for this store`);
+          await page.context().close();
+          page = null;
+          useFree = false; // all remaining pages will use paid
+        } else {
+          const links = await parser.parseProductLinks(page);
+          console.log(`     ↳ ${links.length} links (free)`);
+          links.forEach(l => productUrls.add(l));
+          currentUrl = await parser.getNextPageUrl(page);
+          pageNum++;
+          success = true;
+        }
+      } catch (err) {
+        console.log(`  ⚠️  Free scrape failed (${err.message.substring(0, 60)}) — falling back to Bright Data`);
+        if (page) { try { await page.context().close(); } catch (_) {} page = null; }
+        useFree = false;
+      }
     }
+
+    // ── Use Bright Data (either directly or as fallback) ─────
+    if (!success) {
+      try {
+        const browser = await getPaidBrowser();
+        page = await browser.newPage();
+        await navigatePaid(page, currentUrl);
+        const links = await parser.parseProductLinks(page);
+        console.log(`     ↳ ${links.length} links (Bright Data)`);
+        links.forEach(l => productUrls.add(l));
+        currentUrl = await parser.getNextPageUrl(page);
+        pageNum++;
+      } catch (err) {
+        console.error(`  ❌ Listing page error: ${err.message}`);
+        if (err.message.includes('closed') || err.message.includes('disconnected')) _paidBrowser = null;
+        currentUrl = null;
+      } finally {
+        if (page) { try { await page.close(); } catch (_) {} }
+      }
+    } else {
+      // Close free page context
+      if (page) { try { await page.context().close(); } catch (_) {} }
+    }
+
     await new Promise(r => setTimeout(r, 1500));
   }
 
@@ -171,45 +296,91 @@ async function collectUrlsForCategory(parser, startUrl, urlsCachePath) {
   return productUrls;
 }
 
-async function scrapeProductSafe(parser, productUrl) {
+// ─────────────────────────────────────────────────────────────
+//  PRODUCT SCRAPING — with free/paid fallback
+// ─────────────────────────────────────────────────────────────
+
+async function scrapeProductSafe(store, productUrl) {
+  const { parser, freeScrapable } = store;
+
+  // ── Try free first ────────────────────────────────────────
+  if (freeScrapable) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let page = null;
+      try {
+        const browser = await getFreeBrowser();
+        page = await newStealthPage(browser);
+        await navigateFree(page, productUrl);
+
+        const blocked = await isPageBlocked(page);
+        if (blocked) {
+          console.log(`  ⚠️  Blocked on free — falling back to Bright Data`);
+          await page.context().close();
+          break; // exit free attempts, fall through to paid
+        }
+
+        const product = await parser.parseProductDetails(page, productUrl);
+        await page.context().close();
+
+        if (product?.name) {
+          product.scrapedVia = 'free';
+          return product;
+        }
+        // If no name, fall through to paid
+        break;
+      } catch (err) {
+        if (page) { try { await page.context().close(); } catch (_) {} }
+        if (err.message.includes('closed') || err.message.includes('disconnected')) _freeBrowser = null;
+        if (attempt === 2) break; // give up on free after 2 attempts
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+    console.log(`  💳 Falling back to Bright Data for: ${productUrl.split('/').slice(-2, -1)[0]}`);
+  }
+
+  // ── Bright Data (direct or fallback) ─────────────────────
   for (let attempt = 1; attempt <= 3; attempt++) {
     let page = null;
     try {
-      const browser = await getBrowser();
+      const browser = await getPaidBrowser();
       page = await browser.newPage();
-      await navigateSafe(page, productUrl);
+      await navigatePaid(page, productUrl);
       const product = await parser.parseProductDetails(page, productUrl);
       await page.close();
+      if (product) product.scrapedVia = 'brightdata';
       return product;
     } catch (err) {
-      if (page) try { await page.close(); } catch (_) {}
+      if (page) { try { await page.close(); } catch (_) {} }
       const dead = err.message.includes('closed') ||
                    err.message.includes('disconnected') ||
                    err.message.includes('Target page');
-      if (dead) { _browser = null; console.log(`  ⚠️  Attempt ${attempt}: browser died`); }
+      if (dead) { _paidBrowser = null; console.log(`  ⚠️  Attempt ${attempt}: Bright Data browser died`); }
       else console.error(`  ⚠️  Attempt ${attempt}: ${err.message}`);
       if (attempt < 3) await new Promise(r => setTimeout(r, 4000 * attempt));
     }
   }
-  return null; // never throws — main loop always continues
+
+  return null;
 }
 
+// ─────────────────────────────────────────────────────────────
+//  CATEGORY ORCHESTRATOR
+// ─────────────────────────────────────────────────────────────
+
 async function scrapeCategory(store, category) {
-  const { name: storeName, parser } = store;
+  const { name: storeName, freeScrapable } = store;
   const { slug, url: startUrl } = category;
 
   console.log(`\n${'─'.repeat(60)}`);
-  console.log(`🏪 Store: ${storeName}  📂 Category: ${slug}`);
+  console.log(`🏪 Store: ${storeName}  📂 Category: ${slug}  [${freeScrapable ? '🆓 free-first' : '💳 paid-only'}]`);
   console.log(`${'─'.repeat(60)}`);
 
   const paths = getPaths(storeName, slug);
   ensureDir(paths.dir);
 
-  // Phase 1: Collect URLs
-  const productUrls = await collectUrlsForCategory(parser, startUrl, paths.urlsCache);
+  const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache);
   console.log(`  ✅ ${productUrls.size} product URLs total`);
 
-  // Phase 2: Scrape each product
   const visited = new Set(readJson(paths.visitedCache, []));
   const total   = productUrls.size;
   let done      = visited.size;
@@ -218,19 +389,25 @@ async function scrapeCategory(store, category) {
     console.log(`  ♻️  Resuming: ${visited.size} done, ${total - visited.size} remaining`);
   }
 
+  let freeCount = 0;
+  let paidCount = 0;
+
   for (const productUrl of productUrls) {
     if (visited.has(productUrl)) continue;
     done++;
 
     process.stdout.write(`  🛒 [${done}/${total}] `);
 
-    const product = await scrapeProductSafe(parser, productUrl);
+    const product = await scrapeProductSafe(store, productUrl);
 
     if (product?.name) {
       appendProduct(paths.fullOutput, product);
       rebuildPriceFile(paths.fullOutput, paths.priceOutput);
-      console.log(`✅ ${product.name.substring(0, 60)}`);
-      console.log(`     SKU: ${product.sku || 'N/A'} | ${product.salePrice || 'N/A'} | ${product.stockStatus || 'N/A'}`);
+      const via = product.scrapedVia === 'free' ? '🆓' : '💳';
+      console.log(`${via} ${product.name.substring(0, 55)}`);
+
+      if (product.scrapedVia === 'free') freeCount++;
+      else paidCount++;
     } else {
       console.log(`⚠️  No data — ${productUrl}`);
     }
@@ -238,15 +415,18 @@ async function scrapeCategory(store, category) {
     visited.add(productUrl);
     writeJson(paths.visitedCache, [...visited]);
 
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, freeCount > paidCount ? 2000 : 1500));
   }
 
-  console.log(`\n  🏁 ${storeName}/${slug} complete: ${done} products scraped`);
+  console.log(`\n  🏁 ${storeName}/${slug} complete: ${done} products`);
+  console.log(`     🆓 Free: ${freeCount}  💳 Bright Data: ${paidCount}`);
   console.log(`     Full  → ${paths.fullOutput}`);
   console.log(`     Price → ${paths.priceOutput}`);
 }
 
-// ── Main ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  MAIN
+// ─────────────────────────────────────────────────────────────
 
 async function scrape() {
   if (!AUTH || AUTH.includes('your_username')) {
@@ -254,12 +434,13 @@ async function scrape() {
   }
 
   console.log('🚀 Multi-store price scraper starting...\n');
-  console.log(`Stores configured: ${STORES.map(s => s.name).join(', ')}`);
+  console.log(`Stores: ${STORES.map(s => `${s.name}(${s.freeScrapable ? '🆓→💳' : '💳'})`).join(', ')}`);
 
   const totalCategories = STORES.reduce((acc, s) => acc + s.categories.length, 0);
   console.log(`Total categories: ${totalCategories}\n`);
 
-  await getBrowser();
+  // Pre-connect paid browser (needed for paid-only stores)
+  await getPaidBrowser();
 
   for (const store of STORES) {
     for (const category of store.categories) {
@@ -267,12 +448,12 @@ async function scrape() {
         await scrapeCategory(store, category);
       } catch (err) {
         console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
-        // Continue to next category even if this one fails
       }
     }
   }
 
-  if (_browser) try { await _browser.close(); } catch (_) {}
+  if (_freeBrowser) try { await _freeBrowser.close(); } catch (_) {}
+  if (_paidBrowser) try { await _paidBrowser.close(); } catch (_) {}
 
   console.log('\n\n🎉 All stores and categories complete!');
   console.log('Output saved in: output/<store>/<category>/');
@@ -282,313 +463,3 @@ scrape().catch(err => {
   console.error('Fatal error:', err.message);
   process.exit(1);
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// require('dotenv').config();
-// const { chromium } = require('playwright');
-// const fs = require('fs');
-// const path = require('path');
-// const { CATEGORY_URLS } = require('./urls');
-// const { parseProductLinks, getNextPageUrl, parseProductDetails } = require('./parser');
-
-// const AUTH = process.env.BRIGHT_DATA_AUTH;
-
-// // ── Output setup ──────────────────────────────────────────────
-// const RUN_ID = Date.now();
-// const OUTPUT_DIR = path.join('output', `run_${RUN_ID}`);
-// const FULL_OUTPUT   = path.join(OUTPUT_DIR, 'products_full.json');
-// const PRICE_OUTPUT  = path.join(OUTPUT_DIR, 'products_prices.json');
-
-// // ── IMPORTANT: Point these at your EXISTING run folder so it resumes ──
-// // Change this to your actual folder name, e.g. "run_1776343255891"
-// // If you want a fresh start, set RESUME_FROM_RUN = null
-// const RESUME_FROM_RUN = 'run_1776343255891'; // ← UPDATE THIS to your folder name
-
-// const URLS_CACHE    = RESUME_FROM_RUN
-//   ? path.join('output', RESUME_FROM_RUN, 'collected_urls.json')
-//   : path.join(OUTPUT_DIR, 'collected_urls.json');
-
-// const VISITED_CACHE = path.join(OUTPUT_DIR, 'visited.json');
-
-// // ─────────────────────────────────────────────────────────────
-
-// function ensureOutputDir() {
-//   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-// }
-
-// function saveProduct(product) {
-//   let existing = [];
-//   if (fs.existsSync(FULL_OUTPUT)) {
-//     try { existing = JSON.parse(fs.readFileSync(FULL_OUTPUT, 'utf8')); } catch (_) {}
-//   }
-//   existing.push(product);
-//   fs.writeFileSync(FULL_OUTPUT, JSON.stringify(existing, null, 2));
-// }
-
-// function rebuildPriceFile() {
-//   if (!fs.existsSync(FULL_OUTPUT)) return;
-//   try {
-//     const all = JSON.parse(fs.readFileSync(FULL_OUTPUT, 'utf8'));
-//     const prices = all.map(p => ({
-//       sku:           p.sku,
-//       name:          p.name,
-//       category:      p.category,
-//       salePrice:     p.salePrice,
-//       originalPrice: p.originalPrice,
-//       stockStatus:   p.stockStatus,
-//       discountBadge: p.discountBadge,
-//       tags:          p.tags,
-//       url:           p.url,
-//       scrapedAt:     p.scrapedAt,
-//     }));
-//     fs.writeFileSync(PRICE_OUTPUT, JSON.stringify(prices, null, 2));
-//   } catch (_) {}
-// }
-
-// function saveVisited(visited) {
-//   fs.writeFileSync(VISITED_CACHE, JSON.stringify([...visited], null, 2));
-// }
-
-// function loadVisited() {
-//   if (!fs.existsSync(VISITED_CACHE)) return new Set();
-//   try { return new Set(JSON.parse(fs.readFileSync(VISITED_CACHE, 'utf8'))); } catch (_) { return new Set(); }
-// }
-
-// function saveCollectedUrls(urls) {
-//   fs.writeFileSync(URLS_CACHE, JSON.stringify([...urls], null, 2));
-// }
-
-// function loadCollectedUrls() {
-//   if (!fs.existsSync(URLS_CACHE)) return null;
-//   try { return new Set(JSON.parse(fs.readFileSync(URLS_CACHE, 'utf8'))); } catch (_) { return null; }
-// }
-
-// // ── Browser management ────────────────────────────────────────
-// // A simple wrapper that always gives you a live browser,
-// // reconnecting automatically whenever it drops.
-
-// let _browser = null;
-
-// async function connectBrowser(retries = 5) {
-//   for (let i = 1; i <= retries; i++) {
-//     try {
-//       console.log(`🔌 Connecting to Bright Data... (attempt ${i})`);
-//       const browser = await chromium.connectOverCDP(
-//         `wss://${AUTH}@brd.superproxy.io:9222`,
-//         { timeout: 60_000 }
-//       );
-//       console.log('✅ Connected');
-//       // Auto-reconnect when the browser closes unexpectedly
-//       browser.on('disconnected', () => {
-//         console.log('⚡ Browser disconnected — will reconnect on next request');
-//         _browser = null;
-//       });
-//       return browser;
-//     } catch (err) {
-//       console.error(`  ❌ Connection failed: ${err.message}`);
-//       if (i < retries) {
-//         const wait = i * 3000;
-//         console.log(`  ⏳ Retrying in ${wait / 1000}s...`);
-//         await new Promise(r => setTimeout(r, wait));
-//       } else {
-//         throw new Error(`Could not connect after ${retries} attempts`);
-//       }
-//     }
-//   }
-// }
-
-// async function getBrowser() {
-//   if (!_browser) {
-//     _browser = await connectBrowser();
-//   }
-//   return _browser;
-// }
-
-// // ── Navigation ────────────────────────────────────────────────
-
-// async function navigateSafe(page, url) {
-//   await page.goto(url, { timeout: 2 * 60 * 1000, waitUntil: 'domcontentloaded' });
-//   try {
-//     const client = await page.context().newCDPSession(page);
-//     const { status } = await client.send('Captcha.waitForSolve', { detectTimeout: 15_000 });
-//     if (status !== 'not_detected') console.log(`  🔓 Captcha solved: ${status}`);
-//   } catch (_) {}
-//   await page.waitForSelector('body', { timeout: 30_000 });
-//   await page.waitForTimeout(2000);
-// }
-
-// // ── Scrape a single product with retry + auto-reconnect ───────
-
-// async function scrapeProduct(productUrl) {
-//   const MAX_ATTEMPTS = 3;
-
-//   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-//     let page = null;
-//     try {
-//       const browser = await getBrowser();  // reconnects if needed
-//       page = await browser.newPage();
-//       await navigateSafe(page, productUrl);
-//       const product = await parseProductDetails(page, productUrl);
-//       await page.close();
-//       return product;
-
-//     } catch (err) {
-//       // Close the page if it's still open
-//       if (page) {
-//         try { await page.close(); } catch (_) {}
-//       }
-
-//       const isBrowserDead =
-//         err.message.includes('closed') ||
-//         err.message.includes('disconnected') ||
-//         err.message.includes('Target page');
-
-//       if (isBrowserDead) {
-//         console.log(`  ⚠️  Attempt ${attempt}: browser died — reconnecting...`);
-//         _browser = null; // force reconnect on next getBrowser() call
-//       } else {
-//         console.error(`  ⚠️  Attempt ${attempt} failed: ${err.message}`);
-//       }
-
-//       if (attempt < MAX_ATTEMPTS) {
-//         await new Promise(r => setTimeout(r, 4000 * attempt));
-//       }
-//     }
-//   }
-
-//   console.error(`  ❌ Giving up on: ${productUrl}`);
-//   return null; // ← never throws, just returns null so the loop continues
-// }
-
-// // ── Category link collection ──────────────────────────────────
-
-// async function collectProductUrlsFromCategory(startUrl) {
-//   const productUrls = new Set();
-//   let currentUrl = startUrl;
-//   let pageNum = 1;
-
-//   while (currentUrl) {
-//     console.log(`  📄 Page ${pageNum}: ${currentUrl}`);
-//     let page = null;
-//     try {
-//       const browser = await getBrowser();
-//       page = await browser.newPage();
-//       await navigateSafe(page, currentUrl);
-//       const links = await parseProductLinks(page);
-//       console.log(`     Found ${links.length} product links`);
-//       links.forEach(l => productUrls.add(l));
-//       currentUrl = await getNextPageUrl(page);
-//       pageNum++;
-//     } catch (err) {
-//       console.error(`  ❌ Error on listing page: ${err.message}`);
-//       if (err.message.includes('closed') || err.message.includes('disconnected')) {
-//         _browser = null;
-//       }
-//       currentUrl = null;
-//     } finally {
-//       if (page) { try { await page.close(); } catch (_) {} }
-//     }
-//     await new Promise(r => setTimeout(r, 1500));
-//   }
-
-//   return productUrls;
-// }
-
-// // ── Main ──────────────────────────────────────────────────────
-
-// async function scrape() {
-//   if (!AUTH || AUTH.includes('your_username')) {
-//     throw new Error('Set BRIGHT_DATA_AUTH in your .env file');
-//   }
-
-//   ensureOutputDir();
-//   console.log(`📁 Output folder: ${OUTPUT_DIR}\n`);
-
-//   // Initial connection
-//   await getBrowser();
-
-//   // ── Phase 1: Collect all product URLs ──────────────────────
-//   let productUrls = loadCollectedUrls();
-
-//   if (productUrls) {
-//     console.log(`♻️  Resuming from cached URLs (${productUrls.size} URLs)\n`);
-//   } else {
-//     productUrls = new Set();
-//     for (const categoryUrl of CATEGORY_URLS) {
-//       console.log(`\n📂 Category: ${categoryUrl}`);
-//       try {
-//         const urls = await collectProductUrlsFromCategory(categoryUrl);
-//         console.log(`   ✅ ${urls.size} products found`);
-//         urls.forEach(u => productUrls.add(u));
-//         saveCollectedUrls(productUrls);
-//       } catch (err) {
-//         console.error(`  ❌ Category failed: ${err.message}`);
-//       }
-//     }
-//     console.log(`\n✅ Total unique product URLs: ${productUrls.size}`);
-//     saveCollectedUrls(productUrls);
-//   }
-
-//   // ── Phase 2: Scrape each product page ──────────────────────
-//   const visited = loadVisited();
-//   const total = productUrls.size;
-//   let doneCount = visited.size;
-
-//   if (visited.size > 0) {
-//     console.log(`♻️  Resuming — ${visited.size} already scraped, ${total - visited.size} remaining\n`);
-//   }
-
-//   for (const productUrl of productUrls) {
-//     if (visited.has(productUrl)) continue;
-//     doneCount++;
-
-//     console.log(`\n🛒 [${doneCount}/${total}] ${productUrl}`);
-
-//     // scrapeProduct() NEVER throws — it returns null on total failure
-//     const product = await scrapeProduct(productUrl);
-
-//     if (product?.name) {
-//       saveProduct(product);
-//       rebuildPriceFile();
-//       console.log(`  ✅ ${product.name}`);
-//       console.log(`     SKU: ${product.sku} | Price: ${product.salePrice} | Stock: ${product.stockStatus}`);
-//     } else {
-//       console.log(`  ⚠️  Skipped (no product name found)`);
-//     }
-
-//     // Always mark as visited so we don't retry failed ones endlessly
-//     visited.add(productUrl);
-//     saveVisited(visited);
-
-//     await new Promise(r => setTimeout(r, 1500));
-//   }
-
-//   if (_browser) {
-//     try { await _browser.close(); } catch (_) {}
-//   }
-
-//   console.log(`\n🎉 Done!`);
-//   console.log(`   Full data  → ${FULL_OUTPUT}`);
-//   console.log(`   Price data → ${PRICE_OUTPUT}`);
-// }
-
-// scrape().catch(err => {
-//   console.error('Fatal error:', err.message);
-//   process.exit(1);
-// });
