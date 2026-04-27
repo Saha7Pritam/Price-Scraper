@@ -11,7 +11,7 @@ async function parseProductLinks(page) {
           href.includes('pickpcparts.in/storages/') ||
           href.includes('pickpcparts.in/graphics_cards/') ||
           href.includes('pickpcparts.in/rams/') ||
-          href.includes('pickpcparts.in/motherboards/')) {
+          href.includes('pickpcparts.in/motherboards/') || href.includes('pickpcparts.in/keyboards/') || href.includes('pickpcparts.in/mice/')) {
         links.add(href.split('?')[0]);
       }
     });
