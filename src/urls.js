@@ -16,7 +16,8 @@ const STORES = [
     categories: [
       { slug: 'cpu-processor', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-processor/' },
       //{ slug: 'motherboards',  url: 'https://www.primeabgb.com/buy-online-price-india/motherboards/' },
-      { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
+      // { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
+      {slug: 'HDD',      url: 'https://www.primeabgb.com/buy-online-price-india/internal-hard-drive/' },
       // { slug: 'ram-memory',    url: 'https://www.primeabgb.com/buy-online-price-india/ram-memory/' },
     ],
   },
@@ -28,7 +29,7 @@ const STORES = [
     categories: [
       { slug: 'cpu-processor', url: 'https://mdcomputers.in/catalog/processor' },
       //{ slug: 'motherboards',  url: 'https://mdcomputers.in/catalog/motherboard' },
-      { slug: 'ram-memory',    url: 'https://mdcomputers.in/catalog/ram' },
+      //{ slug: 'ram-memory',    url: 'https://mdcomputers.in/catalog/ram' },
     ],
   },
 
@@ -38,10 +39,12 @@ const STORES = [
     parser: require('./parsers/pickpcparts'),
     categories: [
       { slug: 'cpu-processor', url: 'https://pickpcparts.in/processors/' },
-      { slug: 'ram-memory',    url: 'https://pickpcparts.in/rams/' },
-      { slug: 'motherboards',  url: 'https://pickpcparts.in/motherboards/' },
-      { slug: 'graphic-cards', url: 'https://pickpcparts.in/graphics_cards/' },
-      { slug: 'storages',      url: 'https://pickpcparts.in/storages/' },
+      //{ slug: 'ram-memory',    url: 'https://pickpcparts.in/rams/' },
+      //{ slug: 'motherboards',  url: 'https://pickpcparts.in/motherboards/' },
+     // { slug: 'graphic-cards', url: 'https://pickpcparts.in/graphics_cards/' },
+      //{ slug: 'storages',      url: 'https://pickpcparts.in/storages/' },
+      { slug:'Keyboards', url: 'https://pickpcparts.in/keyboards/' },
+      { slug:'Mouse', url: 'https://pickpcparts.in/mice/' },
     ],
   },
 
