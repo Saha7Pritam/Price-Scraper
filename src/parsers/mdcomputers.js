@@ -7,8 +7,6 @@ async function parseProductLinks(page) {
     const links = new Set();
     document.querySelectorAll('a[href]').forEach(a => {
       const href = a.href;
-      // MDComputers product URLs pattern:
-      // mdcomputers.in/product/amd-ryzen-5-5500-.../processor
       if (href.includes('mdcomputers.in/product/')) {
         links.add(href.split('?')[0]);
       }
@@ -19,19 +17,33 @@ async function parseProductLinks(page) {
 
 async function getNextPageUrl(page) {
   return await page.evaluate(() => {
-    // MDComputers uses ?page=2 style pagination
-    const next = document.querySelector('a[rel="next"], .pagination li.active + li a, ul.pagination a');
-    if (next && next.href && !next.href.includes('javascript')) return next.href;
+    // MDComputers uses Bootstrap pagination with ?page=N query params.
+    //
+    // FIX: The old selector matched ANY pagination link including the current
+    // page or previous links, causing an infinite loop between page 1 and page 2.
+    //
+    // Strategy: find the <li class="active"> item, then get the NEXT sibling's link.
+    // Only return it if it's a real numeric next page (not "»" or disabled).
 
-    // Fallback: look for a ">" or "Next" link
-    const allLinks = [...document.querySelectorAll('.pagination a')];
-    const current = document.querySelector('.pagination li.active');
-    if (current) {
-      const nextLi = current.nextElementSibling;
-      const nextA = nextLi?.querySelector('a');
-      if (nextA && nextA.href) return nextA.href;
-    }
-    return null;
+    const activeLi = document.querySelector('ul.pagination li.active');
+    if (!activeLi) return null;
+
+    const nextLi = activeLi.nextElementSibling;
+    if (!nextLi) return null;
+
+    // Skip if it's a disabled item or a "»" / "next" arrow without a page number
+    if (nextLi.classList.contains('disabled')) return null;
+
+    const nextA = nextLi.querySelector('a');
+    if (!nextA || !nextA.href) return null;
+
+    // Must be a URL with ?page= to be a valid next page
+    if (!nextA.href.includes('?page=') && !nextA.href.includes('page=')) return null;
+
+    // Don't follow if it points back to the same URL as current page
+    if (nextA.href === window.location.href) return null;
+
+    return nextA.href;
   });
 }
 
@@ -41,14 +53,12 @@ async function parseProductDetails(page, url) {
       document.querySelector(selector)?.innerText?.trim() || null;
 
     // ── Name ──────────────────────────────────────────────────
-    // From screenshots: <h1> or <h2> with product title
     const name =
       getText('h1') ||
       getText('h2.product-name') ||
       getText('.product-title');
 
     // ── Prices ────────────────────────────────────────────────
-    // From screenshots: "Offer Price ₹8,659" and "(54% off) ₹19,000"
     const salePrice =
       getText('.offer-price') ||
       getText('.special-price .price') ||
@@ -60,7 +70,6 @@ async function parseProductDetails(page, url) {
       getText('.regular-price .price') ||
       null;
 
-    // Discount badge: "54% off" shown in red badge
     const discountBadge =
       getText('.discount-badge') ||
       getText('.badge-danger') ||
@@ -68,20 +77,16 @@ async function parseProductDetails(page, url) {
       null;
 
     // ── SKU ───────────────────────────────────────────────────
-    // MDComputers shows SKU in product details or breadcrumb slug
-    // Extract from URL as fallback: /product/amd-ryzen-5-5500-100-100000457box.../
-    const skuFromMeta = getText('.product-code') ||
+    const skuFromMeta =
+      getText('.product-code') ||
       getText('.sku') ||
       getText('[class*="model"]') ||
       null;
 
-    // Fallback: extract from URL
     const urlSlug = pageUrl.split('/product/')[1]?.split('/')[0] || null;
-
     const sku = skuFromMeta || urlSlug;
 
     // ── Stock Status ──────────────────────────────────────────
-    // From screenshots filter: "In Stock" / "Out of Stock"
     const stockStatus =
       getText('.stock-status') ||
       getText('.availability') ||
@@ -89,19 +94,17 @@ async function parseProductDetails(page, url) {
       null;
 
     // ── Rating ────────────────────────────────────────────────
-    const rating = getText('.rating-num') ||
+    const rating =
+      getText('.rating-num') ||
       getText('.stars') ||
       null;
 
     // ── Category (from breadcrumb) ────────────────────────────
-    // From screenshots: Home / Processor / AMD Ryzen 5 5500 Processor
     const breadcrumbs = [...document.querySelectorAll('.breadcrumb li, nav ol li')]
       .map(li => li.innerText?.trim())
       .filter(t => t && t !== '/' && t !== 'Home');
 
-    const category = breadcrumbs.length > 0
-      ? breadcrumbs[0]  // "Processor" is first after Home
-      : null;
+    const category = breadcrumbs.length > 0 ? breadcrumbs[0] : null;
 
     // ── Images ───────────────────────────────────────────────
     const images = [...document.querySelectorAll(
