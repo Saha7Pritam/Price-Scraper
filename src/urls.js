@@ -15,8 +15,8 @@ const STORES = [
     parser: require('./parsers/primeabgb'),
     categories: [
       { slug: 'cpu-processor', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-processor/' },
-      // { slug: 'motherboards',  url: 'https://www.primeabgb.com/buy-online-price-india/motherboards/' },
-      // { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
+      //{ slug: 'motherboards',  url: 'https://www.primeabgb.com/buy-online-price-india/motherboards/' },
+      { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
       // { slug: 'ram-memory',    url: 'https://www.primeabgb.com/buy-online-price-india/ram-memory/' },
     ],
   },
@@ -27,8 +27,8 @@ const STORES = [
     parser: require('./parsers/mdcomputers'),
     categories: [
       { slug: 'cpu-processor', url: 'https://mdcomputers.in/catalog/processor' },
-      // { slug: 'motherboards',  url: 'https://mdcomputers.in/catalog/motherboard' },
-      // { slug: 'ram-memory',    url: 'https://mdcomputers.in/catalog/ram' },
+      //{ slug: 'motherboards',  url: 'https://mdcomputers.in/catalog/motherboard' },
+      { slug: 'ram-memory',    url: 'https://mdcomputers.in/catalog/ram' },
     ],
   },
 
@@ -39,9 +39,9 @@ const STORES = [
     categories: [
       { slug: 'cpu-processor', url: 'https://pickpcparts.in/processors/' },
       { slug: 'ram-memory',    url: 'https://pickpcparts.in/rams/' },
-      // { slug: 'motherboards',  url: 'https://pickpcparts.in/motherboards/' },
-      // { slug: 'graphic-cards', url: 'https://pickpcparts.in/graphics_cards/' },
-      // { slug: 'storages',      url: 'https://pickpcparts.in/storages/' },
+      { slug: 'motherboards',  url: 'https://pickpcparts.in/motherboards/' },
+      { slug: 'graphic-cards', url: 'https://pickpcparts.in/graphics_cards/' },
+      { slug: 'storages',      url: 'https://pickpcparts.in/storages/' },
     ],
   },
 
