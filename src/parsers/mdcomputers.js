@@ -50,26 +50,30 @@ async function parseProductDetails(page, url) {
     // ── Prices ────────────────────────────────────────────────
     // From screenshots: "Offer Price ₹8,659" and "(54% off) ₹19,000"
     const salePrice =
-  getText('h2.special-price') ||
-  getText('.special-price') ||
-  null;
+      getText('.offer-price') ||
+      getText('.special-price .price') ||
+      getText('.price-new') ||
+      null;
 
-const originalPrice =
-  getText('span.price-old') ||
-  getText('.price-old') ||
-  null;
+    const originalPrice =
+      getText('.price-old') ||
+      getText('.regular-price .price') ||
+      null;
 
-const discountBadge =
-  getText('span.discount-percentage') ||
-  null;
+    // Discount badge: "54% off" shown in red badge
+    const discountBadge =
+      getText('.discount-badge') ||
+      getText('.badge-danger') ||
+      getText('[class*="off"]') ||
+      null;
 
     // ── SKU ───────────────────────────────────────────────────
     // MDComputers shows SKU in product details or breadcrumb slug
     // Extract from URL as fallback: /product/amd-ryzen-5-5500-100-100000457box.../
-    const skuFromMeta =
-  getText('.product-code span:last-child') ||
-  getText('.product-code') ||
-  null;
+    const skuFromMeta = getText('.product-code') ||
+      getText('.sku') ||
+      getText('[class*="model"]') ||
+      null;
 
     // Fallback: extract from URL
     const urlSlug = pageUrl.split('/product/')[1]?.split('/')[0] || null;
