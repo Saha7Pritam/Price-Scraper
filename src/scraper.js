@@ -126,20 +126,14 @@ async function navigatePaid(page, url) {
 
 // ─────────────────────────────────────────────────────────────
 //  DETECTION HELPERS
-//  These detect if a free scrape was blocked so we know
-//  whether to fall back to Bright Data.
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Returns true if the page content looks like a block/CAPTCHA page
- * rather than real product data.
- */
 async function isPageBlocked(page) {
-  const title = await page.title().catch(() => '');
+  const title   = await page.title().catch(() => '');
   const content = await page.content().catch(() => '');
 
   const blockSignals = [
-    'Just a moment',        // Cloudflare challenge
+    'Just a moment',
     'cf-browser-verification',
     'captcha',
     'Access denied',
@@ -150,7 +144,7 @@ async function isPageBlocked(page) {
     'robot',
   ];
 
-  const titleLower = title.toLowerCase();
+  const titleLower   = title.toLowerCase();
   const contentLower = content.toLowerCase();
 
   return blockSignals.some(signal =>
@@ -176,6 +170,9 @@ function writeJson(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
+// FIX: priceOutput was accidentally commented out — restored here.
+// Removing it caused: "path argument must be of type string... Received undefined"
+// which crashed every category after the first product attempt.
 function getPaths(storeName, categorySlug) {
   const dir = path.join('output', storeName, categorySlug);
   return {
@@ -183,7 +180,7 @@ function getPaths(storeName, categorySlug) {
     urlsCache:    path.join(dir, 'collected_urls.json'),
     visitedCache: path.join(dir, 'visited.json'),
     fullOutput:   path.join(dir, 'products_full.json'),
-    //priceOutput:  path.join(dir, 'products_prices.json'),
+    priceOutput:  path.join(dir, 'products_prices.json'),  // ← was commented out — FIXED
   };
 }
 
@@ -204,13 +201,14 @@ function rebuildPriceFile(fullOutputPath, priceOutputPath) {
     originalPrice:  p.originalPrice,
     stockStatus:    p.stockStatus,
     discountBadge:  p.discountBadge,
-    partIds:        p.partIds,
+    partId:         p.partId,
+    partId2:        p.partId2,
     lowestPrice:    p.lowestPrice,
     retailerPrices: p.retailerPrices,
     tags:           p.tags,
     url:            p.url,
     scrapedAt:      p.scrapedAt,
-    scrapedVia:     p.scrapedVia,  // 'free' or 'brightdata'
+    scrapedVia:     p.scrapedVia,
   }));
   writeJson(priceOutputPath, prices);
 }
@@ -229,13 +227,24 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   const { parser, freeScrapable } = store;
   const productUrls = new Set();
   let currentUrl = startUrl;
-  let pageNum = 1;
-  // Track if free scraping worked — if first page fails, switch to paid for all remaining pages
-  let useFree = freeScrapable;
+  let pageNum    = 1;
+  let useFree    = freeScrapable;
+
+  // FIX: track visited listing pages to prevent infinite pagination loops.
+  // MDComputers getNextPageUrl was cycling between /catalog/ram and /catalog/ram?page=2
+  // endlessly because the "next" selector matched the wrong element.
+  const visitedListingUrls = new Set();
 
   while (currentUrl) {
+    // Stop if we've already visited this listing URL (infinite loop guard)
+    if (visitedListingUrls.has(currentUrl)) {
+      console.log(`  ⚠️  Pagination loop detected at ${currentUrl} — stopping`);
+      break;
+    }
+    visitedListingUrls.add(currentUrl);
+
     console.log(`  📄 Page ${pageNum} [${useFree ? '🆓 free' : '💳 paid'}]: ${currentUrl}`);
-    let page = null;
+    let page    = null;
     let success = false;
 
     // ── Try free first (if enabled) ──────────────────────────
@@ -249,8 +258,8 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
         if (blocked) {
           console.log(`  ⚠️  Free scrape blocked — switching to Bright Data for this store`);
           await page.context().close();
-          page = null;
-          useFree = false; // all remaining pages will use paid
+          page    = null;
+          useFree = false;
         } else {
           const links = await parser.parseProductLinks(page);
           console.log(`     ↳ ${links.length} links (free)`);
@@ -260,13 +269,13 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
           success = true;
         }
       } catch (err) {
-        console.log(`  ⚠️  Free scrape failed (${err.message.substring(0, 60)}) — falling back to Bright Data`);
+        console.log(`  ⚠️  Free failed (${err.message.substring(0, 60)}) — falling back to Bright Data`);
         if (page) { try { await page.context().close(); } catch (_) {} page = null; }
         useFree = false;
       }
     }
 
-    // ── Use Bright Data (either directly or as fallback) ─────
+    // ── Use Bright Data (direct or fallback) ─────────────────
     if (!success) {
       try {
         const browser = await getPaidBrowser();
@@ -285,7 +294,6 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
         if (page) { try { await page.close(); } catch (_) {} }
       }
     } else {
-      // Close free page context
       if (page) { try { await page.context().close(); } catch (_) {} }
     }
 
@@ -316,7 +324,7 @@ async function scrapeProductSafe(store, productUrl) {
         if (blocked) {
           console.log(`  ⚠️  Blocked on free — falling back to Bright Data`);
           await page.context().close();
-          break; // exit free attempts, fall through to paid
+          break;
         }
 
         const product = await parser.parseProductDetails(page, productUrl);
@@ -326,12 +334,11 @@ async function scrapeProductSafe(store, productUrl) {
           product.scrapedVia = 'free';
           return product;
         }
-        // If no name, fall through to paid
         break;
       } catch (err) {
         if (page) { try { await page.context().close(); } catch (_) {} }
         if (err.message.includes('closed') || err.message.includes('disconnected')) _freeBrowser = null;
-        if (attempt === 2) break; // give up on free after 2 attempts
+        if (attempt === 2) break;
         await new Promise(r => setTimeout(r, 3000));
       }
     }
@@ -412,6 +419,7 @@ async function scrapeCategory(store, category) {
       console.log(`⚠️  No data — ${productUrl}`);
     }
 
+    // Always save visited — even on failure — so we don't retry endlessly
     visited.add(productUrl);
     writeJson(paths.visitedCache, [...visited]);
 
@@ -439,7 +447,6 @@ async function scrape() {
   const totalCategories = STORES.reduce((acc, s) => acc + s.categories.length, 0);
   console.log(`Total categories: ${totalCategories}\n`);
 
-  // Pre-connect paid browser (needed for paid-only stores)
   await getPaidBrowser();
 
   for (const store of STORES) {
