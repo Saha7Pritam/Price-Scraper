@@ -63,9 +63,9 @@ async function parseProductDetails(page, url) {
     const sku = getText('.sku') || null;
 
     const stockStatus =
-      getText('.stock') ||
-      getText('.availability .value') ||
-      null;
+  getText('.stock-availability') ||   // ✅ correct one
+  getText('.stock') ||
+  null;
 
     // ── Category ──────────────────────────────────────────────
     const breadcrumbs = [...document.querySelectorAll('.woocommerce-breadcrumb a, nav.breadcrumb a')]
