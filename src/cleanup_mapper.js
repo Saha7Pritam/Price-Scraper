@@ -3,6 +3,7 @@
 
 require('dotenv').config();
 const { CosmosClient } = require('@azure/cosmos');
+const { v4: uuidv4 } = require('uuid');
 
 const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
 const database  = client.database('ScraperDB');
@@ -18,6 +19,7 @@ function mapProduct(product) {
 
   if (store === 'primeabgb') {
     return {
+      ScrapID      : uuidv4(),
       SKU          : product.sku || null,
       Name         : product.name || null,
       CompetePrice : parsePrice(product.salePrice),
@@ -31,6 +33,7 @@ function mapProduct(product) {
 
   if (store === 'mdcomputers') {
     return {
+      ScrapID      : uuidv4(),
       SKU          : product.productCode || null,
       Name         : product.name || null,
       CompetePrice : parsePrice(product.salePrice),
@@ -50,6 +53,7 @@ function mapProduct(product) {
     );
 
     return {
+      ScrapID      : uuidv4(),
       SKU          : product.partIds?.[0] || null,
       Name         : product.name || null,
       CompetePrice : parsePrice(product.lowestPrice?.price),
