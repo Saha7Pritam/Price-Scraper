@@ -17,7 +17,10 @@ const sqlConfig = {
   database: 'db_tpstechautomata',
   user    : process.env.SQL_USER,
   password: process.env.SQL_PASSWORD,
-  options : { encrypt: true, trustServerCertificate: false }
+  options: {
+    encrypt: true,
+    trustServerCertificate: false
+  }
 };
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -152,6 +155,6 @@ async function runMapper() {
 }
 
 runMapper().catch(err => {
-  console.error('Fatal error:', err.message);
+  console.error('Fatal error FULL:', err);
   process.exit(1);
 });
