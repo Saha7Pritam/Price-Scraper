@@ -13,6 +13,7 @@
   "dependencies": {
     "@azure/cosmos": "^4.9.3",
     "dotenv": "^17.4.2",
+    "mssql": "^12.5.0",
     "playwright": "^1.59.1",
     "uuid": "^14.0.0"
   }
